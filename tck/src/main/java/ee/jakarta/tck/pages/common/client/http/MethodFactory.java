@@ -150,7 +150,7 @@ public class MethodFactory {
         String fullUriString = uri + "?" + query;
         java.net.URI fullUri = new java.net.URI(fullUriString);
         req.setURI(fullUri);
-      } catch (Exception e) {
+      } catch (java.net.URISyntaxException e) {
         throw new IllegalArgumentException("Invalid query string: " + query, e);
       }
     }

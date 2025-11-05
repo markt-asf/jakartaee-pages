@@ -421,8 +421,24 @@ public class HttpRequest {
 
     LOGGER.finer("########## The real value set: " + _followRedirects);
 
-    // Build URI and execute
-    String uri = scheme + "://" + _host + ":" + _port + getRequestPath();
+    // Update the request URI to include scheme, host, and port
+    try {
+      java.net.URI currentUri = _method.getURI();
+      java.net.URI fullUri = new java.net.URI(
+          scheme,
+          null,
+          _host,
+          _port,
+          currentUri.getPath(),
+          currentUri.getQuery(),
+          currentUri.getFragment()
+      );
+      if (_method instanceof org.apache.http.client.methods.HttpRequestBase) {
+        ((org.apache.http.client.methods.HttpRequestBase) _method).setURI(fullUri);
+      }
+    } catch (java.net.URISyntaxException e) {
+      throw new IOException("Failed to build request URI", e);
+    }
     
     // Execute the request
     HttpClientContext context = getContext();
@@ -516,30 +532,45 @@ public class HttpRequest {
     String cookieLine = cookieHeader.substring(cookieHeader.indexOf(':') + 1)
         .trim();
     StringTokenizer st = new StringTokenizer(cookieLine, " ;");
-    org.apache.http.impl.cookie.BasicClientCookie cookie = new org.apache.http.impl.cookie.BasicClientCookie("", "");
-    cookie.setVersion(1);
+    String name = null;
+    String value = null;
+    String domain = null;
+    String path = null;
+    int version = 1;
 
     CookieStore store = getCookieStore();
 
     if (cookieLine.indexOf("$Version") == -1) {
-      cookie.setVersion(0);
+      version = 0;
     }
 
     while (st.hasMoreTokens()) {
       String token = st.nextToken();
+      int eqIndex = token.indexOf('=');
 
       if (token.charAt(0) != '$' && !token.startsWith("Domain")
-          && !token.startsWith("Path")) {
-        String name = token.substring(0, token.indexOf('='));
-        String value = token.substring(token.indexOf('=') + 1);
-        cookie = new org.apache.http.impl.cookie.BasicClientCookie(name, value);
-      } else if (token.indexOf("Domain") > -1) {
-        cookie.setDomain(token.substring(token.indexOf('=') + 1));
-      } else if (token.indexOf("Path") > -1) {
-        cookie.setPath(token.substring(token.indexOf('=') + 1));
+          && !token.startsWith("Path") && eqIndex > 0) {
+        name = token.substring(0, eqIndex);
+        value = token.substring(eqIndex + 1);
+      } else if (token.indexOf("Domain") > -1 && eqIndex > 0) {
+        domain = token.substring(eqIndex + 1);
+      } else if (token.indexOf("Path") > -1 && eqIndex > 0) {
+        path = token.substring(eqIndex + 1);
       }
     }
-    store.addCookie(cookie);
+    
+    if (name != null) {
+      org.apache.http.impl.cookie.BasicClientCookie cookie = 
+          new org.apache.http.impl.cookie.BasicClientCookie(name, value != null ? value : "");
+      cookie.setVersion(version);
+      if (domain != null) {
+        cookie.setDomain(domain);
+      }
+      if (path != null) {
+        cookie.setPath(path);
+      }
+      store.addCookie(cookie);
+    }
 
   }
 
