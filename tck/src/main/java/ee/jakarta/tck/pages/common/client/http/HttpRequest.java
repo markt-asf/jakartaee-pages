@@ -97,7 +97,12 @@ public class HttpRequest {
   /**
    * Method representation of request.
    */
-  private HttpMethod _method = null;
+  private HttpUriRequest _method = null;
+  
+  /**
+   * Response from executing the request
+   */
+  private HttpResponse _response = null;
 
   /**
    * Target web container host
@@ -115,9 +120,19 @@ public class HttpRequest {
   private boolean _isSecure = false;
 
   /**
-   * HTTP state
+   * HTTP context and cookie store
    */
-  private HttpState _state = null;
+  private HttpClientContext _context = null;
+  
+  /**
+   * Cookie store for managing cookies
+   */
+  private CookieStore _cookieStore = null;
+  
+  /**
+   * Credentials provider for authentication
+   */
+  private BasicCredentialsProvider _credentialsProvider = null;
 
   /**
    * Original request line for this request.
@@ -138,6 +153,11 @@ public class HttpRequest {
    * Content length of request body.
    */
   private int _contentLength = 0;
+  
+  /**
+   * Flag for redirect following
+   */
+  private boolean _followRedirects = false;
 
   Header[] _headers = null;
 
@@ -153,9 +173,8 @@ public class HttpRequest {
    * </pre>
    */
   public HttpRequest(String requestLine, String host, int port) {
-    client = new HttpClient();
+    client = HttpClientBuilder.create().build();
     _method = MethodFactory.getInstance(requestLine);
-    _method.setFollowRedirects(false);
     _host = host;
     _port = port;
 
@@ -180,7 +199,11 @@ public class HttpRequest {
    * @return String request path
    */
   public String getRequestPath() {
-    return _method.getPath();
+    try {
+      return _method.getURI().getPath();
+    } catch (Exception e) {
+      return "";
+    }
   }
 
   /**
@@ -190,7 +213,7 @@ public class HttpRequest {
    * @return String request type
    */
   public String getRequestMethod() {
-    return _method.getName();
+    return _method.getMethod();
   }
 
   /**
@@ -222,9 +245,13 @@ public class HttpRequest {
    *          request content
    */
   public void setContent(String content) {
-    if (_method instanceof EntityEnclosingMethod) {
-      ((EntityEnclosingMethod) _method)
-          .setRequestEntity(new StringRequestEntity(content));
+    if (_method instanceof org.apache.http.HttpEntityEnclosingRequest) {
+      try {
+        ((org.apache.http.HttpEntityEnclosingRequest) _method)
+            .setEntity(new StringEntity(content));
+      } catch (Exception e) {
+        LOGGER.log(Level.WARNING, "Failed to set entity", e);
+      }
     }
     _contentLength = content.length();
   }
@@ -259,10 +286,9 @@ public class HttpRequest {
       throw new IllegalArgumentException("Password cannot be null");
     }
 
-    UsernamePasswordCredentials cred = new UsernamePasswordCredentials(username,
-        password);
+    UsernamePasswordCredentials cred = new UsernamePasswordCredentials(username, password);
     AuthScope scope = new AuthScope(_host, _port, realm);
-    getState().setCredentials(scope, cred);
+    getCredentialsProvider().setCredentials(scope, cred);
     LOGGER.finer("Added credentials for '" + username
         + "' with password '" + password + "' in realm '" + realm + "'");
 
@@ -282,9 +308,8 @@ public class HttpRequest {
    *          request header value
    */
   public void addRequestHeader(String headerName, String headerValue) {
-    _method.addRequestHeader(headerName, headerValue);
-    LOGGER.finer("Added request header: "
-        + _method.getRequestHeader(headerName).toExternalForm());
+    _method.addHeader(headerName, headerValue);
+    LOGGER.finer("Added request header: " + headerName + ": " + headerValue);
   }
 
   public void addRequestHeader(String header) {
@@ -312,10 +337,8 @@ public class HttpRequest {
    *          request header value
    */
   public void setRequestHeader(String headerName, String headerValue) {
-    _method.setRequestHeader(headerName, headerValue);
-    LOGGER.finer("Set request header: "
-        + _method.getRequestHeader(headerName).toExternalForm());
-
+    _method.setHeader(headerName, headerValue);
+    LOGGER.finer("Set request header: " + headerName + ": " + headerValue);
   }
 
   /**
@@ -323,7 +346,7 @@ public class HttpRequest {
    * followed. By default, redirects are not followed.
    */
   public void setFollowRedirects(boolean followRedirects) {
-    _method.setFollowRedirects(followRedirects);
+    _followRedirects = followRedirects;
   }
 
   /**
@@ -331,15 +354,25 @@ public class HttpRequest {
    * followed.
    */
   public boolean getFollowRedirects() {
-    return _method.getFollowRedirects();
+    return _followRedirects;
   }
 
   /**
    * <code>setState</code> will set the HTTP state for the current request (i.e.
    * session tracking). This has the side affect
    */
-  public void setState(HttpState state) {
-    _state = state;
+  public void setState(org.apache.http.client.CookieStore state) {
+    _cookieStore = state;
+    _useCookies = true;
+  }
+  
+  /**
+   * Legacy method for compatibility with old HttpState API
+   */
+  @Deprecated
+  public void setState(Object state) {
+    // For backward compatibility, create a new cookie store
+    _cookieStore = new BasicCookieStore();
     _useCookies = true;
   }
 
@@ -347,94 +380,109 @@ public class HttpRequest {
    * <code>execute</code> will dispatch the current request to the target
    * server.
    *
-   * @return HttpResponse the server's response.
+   * @return ee.jakarta.tck.pages.common.client.http.HttpResponse the server's response.
    * @throws IOException
    *           if an I/O error occurs during dispatch.
    */
-  public HttpResponse execute() throws IOException, HttpException {
-    String method;
-    int defaultPort;
-    ProtocolSocketFactory factory;
-
-    if (_method.getFollowRedirects()) {
-      client = new HttpClient();
-
-      if (_isSecure) {
-        method = "https";
-        defaultPort = DEFAULT_SSL_PORT;
-        factory = new SSLProtocolSocketFactory();
-      } else {
-        method = "http";
-        defaultPort = DEFAULT_HTTP_PORT;
-        factory = new DefaultProtocolSocketFactory();
-      }
-
-      Protocol protocol = new Protocol(method, factory, defaultPort);
-      HttpConnection conn = new HttpConnection(_host, _port, protocol);
-
-      if (conn.isOpen()) {
-        throw new IllegalStateException("Connection incorrectly opened");
-      }
-
-      conn.open();
-
-      LOGGER.info("Dispatching request: '" + _requestLine
-          + "' to target server at '" + _host + ":" + _port + "'");
-
-      addSupportHeaders();
-      _headers = _method.getRequestHeaders();
-
-      LOGGER.finer("########## The real value set: " + _method.getFollowRedirects());
-
-      client.getHostConfiguration().setHost(_host, _port, protocol);
-
-      client.executeMethod(_method);
-
-      return new HttpResponse(_host, _port, _isSecure, _method, getState());
-    } else {
-      if (_isSecure) {
-        method = "https";
-        defaultPort = DEFAULT_SSL_PORT;
-        factory = new SSLProtocolSocketFactory();
-      } else {
-        method = "http";
-        defaultPort = DEFAULT_HTTP_PORT;
-        factory = new DefaultProtocolSocketFactory();
-      }
-
-      Protocol protocol = new Protocol(method, factory, defaultPort);
-      HttpConnection conn = new HttpConnection(_host, _port, protocol);
-
-      if (conn.isOpen()) {
-        throw new IllegalStateException("Connection incorrectly opened");
-      }
-
-      conn.open();
-
-      LOGGER.info("Dispatching request: '" + _requestLine
-          + "' to target server at '" + _host + ":" + _port + "'");
-
-      addSupportHeaders();
-      _headers = _method.getRequestHeaders();
-
-      LOGGER.finer("########## The real value set: " + _method.getFollowRedirects());
-
-      _method.execute(getState(), conn);
-
-      return new HttpResponse(_host, _port, _isSecure, _method, getState());
+  public ee.jakarta.tck.pages.common.client.http.HttpResponse execute() throws IOException {
+    String scheme = _isSecure ? "https" : "http";
+    
+    // Configure connection manager
+    Registry<ConnectionSocketFactory> socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
+        .register("http", PlainConnectionSocketFactory.getSocketFactory())
+        .register("https", SSLConnectionSocketFactory.getSocketFactory())
+        .build();
+    
+    PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager(socketFactoryRegistry);
+    
+    // Configure request config for redirects
+    RequestConfig requestConfig = RequestConfig.custom()
+        .setRedirectsEnabled(_followRedirects)
+        .setCookieSpec(CookieSpecs.DEFAULT)
+        .build();
+    
+    // Create HTTP client with configuration
+    HttpClientBuilder clientBuilder = HttpClientBuilder.create()
+        .setConnectionManager(connectionManager)
+        .setDefaultRequestConfig(requestConfig);
+    
+    // Add credentials if set
+    if (_credentialsProvider != null) {
+      clientBuilder.setDefaultCredentialsProvider(_credentialsProvider);
     }
+    
+    client = clientBuilder.build();
+    
+    LOGGER.info("Dispatching request: '" + _requestLine
+        + "' to target server at '" + _host + ":" + _port + "'");
+
+    addSupportHeaders();
+    _headers = _method.getAllHeaders();
+
+    LOGGER.finer("########## The real value set: " + _followRedirects);
+
+    // Build URI and execute
+    String uri = scheme + "://" + _host + ":" + _port + getRequestPath();
+    
+    // Execute the request
+    HttpClientContext context = getContext();
+    _response = client.execute(_method, context);
+
+    return new ee.jakarta.tck.pages.common.client.http.HttpResponse(_host, _port, _isSecure, _method, _response, context);
   }
 
   /**
-   * Returns the current state for this request.
+   * Returns the current context for this request.
    *
-   * @return HttpState current state
+   * @return HttpClientContext current context
    */
-  public HttpState getState() {
-    if (_state == null) {
-      _state = new HttpState();
+  public HttpClientContext getContext() {
+    if (_context == null) {
+      _context = HttpClientContext.create();
+      if (_cookieStore != null) {
+        _context.setCookieStore(_cookieStore);
+      } else if (_useCookies) {
+        _cookieStore = new BasicCookieStore();
+        _context.setCookieStore(_cookieStore);
+      }
+      if (_credentialsProvider != null) {
+        _context.setCredentialsProvider(_credentialsProvider);
+      }
     }
-    return _state;
+    return _context;
+  }
+  
+  /**
+   * Returns the credentials provider for this request.
+   *
+   * @return BasicCredentialsProvider credentials provider
+   */
+  public BasicCredentialsProvider getCredentialsProvider() {
+    if (_credentialsProvider == null) {
+      _credentialsProvider = new BasicCredentialsProvider();
+    }
+    return _credentialsProvider;
+  }
+  
+  /**
+   * Returns the cookie store for this request.
+   *
+   * @return CookieStore cookie store
+   */
+  public CookieStore getCookieStore() {
+    if (_cookieStore == null) {
+      _cookieStore = new BasicCookieStore();
+    }
+    return _cookieStore;
+  }
+  
+  /**
+   * Legacy method for backward compatibility with old HttpState API
+   * @deprecated Use getContext(), getCookieStore(), or getCredentialsProvider() instead
+   */
+  @Deprecated
+  public Object getState() {
+    return getContext();
   }
 
   @Override
@@ -446,7 +494,7 @@ public class HttpRequest {
 
       for (Header _header : _headers) {
         sb.append("       [REQUEST HEADER] -> ");
-        sb.append(_header.toExternalForm()).append('\n');
+        sb.append(_header.toString()).append('\n');
       }
     }
 
@@ -468,14 +516,13 @@ public class HttpRequest {
     String cookieLine = cookieHeader.substring(cookieHeader.indexOf(':') + 1)
         .trim();
     StringTokenizer st = new StringTokenizer(cookieLine, " ;");
-    Cookie cookie = new Cookie();
+    org.apache.http.impl.cookie.BasicClientCookie cookie = new org.apache.http.impl.cookie.BasicClientCookie("", "");
     cookie.setVersion(1);
 
-    getState();
+    CookieStore store = getCookieStore();
 
     if (cookieLine.indexOf("$Version") == -1) {
       cookie.setVersion(0);
-      _method.getParams().setCookiePolicy(CookiePolicy.NETSCAPE);
     }
 
     while (st.hasMoreTokens()) {
@@ -483,17 +530,16 @@ public class HttpRequest {
 
       if (token.charAt(0) != '$' && !token.startsWith("Domain")
           && !token.startsWith("Path")) {
-        cookie.setName(token.substring(0, token.indexOf('=')));
-        cookie.setValue(token.substring(token.indexOf('=') + 1));
+        String name = token.substring(0, token.indexOf('='));
+        String value = token.substring(token.indexOf('=') + 1);
+        cookie = new org.apache.http.impl.cookie.BasicClientCookie(name, value);
       } else if (token.indexOf("Domain") > -1) {
-        cookie.setDomainAttributeSpecified(true);
         cookie.setDomain(token.substring(token.indexOf('=') + 1));
       } else if (token.indexOf("Path") > -1) {
-        cookie.setPathAttributeSpecified(true);
         cookie.setPath(token.substring(token.indexOf('=') + 1));
       }
     }
-    _state.addCookie(cookie);
+    store.addCookie(cookie);
 
   }
 
@@ -533,16 +579,19 @@ public class HttpRequest {
    * to use basic authentication
    */
   private void setBasicAuthorizationHeader() {
-    UsernamePasswordCredentials cred = (UsernamePasswordCredentials) getState()
+    org.apache.http.auth.Credentials cred = getCredentialsProvider()
         .getCredentials(new AuthScope(_host, _port, null));
     String authString = null;
-    if (cred != null) {
+    if (cred instanceof UsernamePasswordCredentials) {
+      UsernamePasswordCredentials upCred = (UsernamePasswordCredentials) cred;
       authString = "Basic " + Base64.getEncoder().encodeToString(
-          (cred.getUserName() + ":" + cred.getPassword()).getBytes(StandardCharsets.UTF_8));
+          (upCred.getUserName() + ":" + upCred.getPassword()).getBytes(StandardCharsets.UTF_8));
     } else {
         LOGGER.finer("NULL CREDENTIALS");
     }
-    _method.setRequestHeader("Authorization", authString);
+    if (authString != null) {
+      _method.setHeader("Authorization", authString);
+    }
   }
 
   /**
@@ -550,7 +599,7 @@ public class HttpRequest {
    */
   private void setContentLengthHeader() {
     if (_contentLength > 0) {
-      _method.setRequestHeader("Content-Length",
+      _method.setHeader("Content-Length",
           Integer.toString(_contentLength));
     }
   }
@@ -567,9 +616,9 @@ public class HttpRequest {
    */
   private void setHostHeader() {
     if (_port == DEFAULT_HTTP_PORT || _port == DEFAULT_SSL_PORT) {
-      _method.setRequestHeader("Host", _host);
+      _method.setHeader("Host", _host);
     } else {
-      _method.setRequestHeader("Host", _host + ":" + _port);
+      _method.setHeader("Host", _host + ":" + _port);
     }
   }
 
@@ -577,13 +626,19 @@ public class HttpRequest {
    * Sets a Cookie header if this request is using cookies.
    */
   private void setCookieHeader() {
-    if (_useCookies) {
-      Cookie[] cookies = _state.getCookies();
-      if (cookies != null && cookies.length > 0) {
-        Header cHeader = CookiePolicy.getCookieSpec(CookiePolicy.RFC_2109)
-            .formatCookieHeader(_state.getCookies());
-        if (cHeader != null) {
-          _method.setRequestHeader(cHeader);
+    if (_useCookies && _cookieStore != null) {
+      java.util.List<Cookie> cookies = _cookieStore.getCookies();
+      if (cookies != null && !cookies.isEmpty()) {
+        StringBuilder cookieHeader = new StringBuilder();
+        for (int i = 0; i < cookies.size(); i++) {
+          Cookie cookie = cookies.get(i);
+          if (i > 0) {
+            cookieHeader.append("; ");
+          }
+          cookieHeader.append(cookie.getName()).append("=").append(cookie.getValue());
+        }
+        if (cookieHeader.length() > 0) {
+          _method.setHeader("Cookie", cookieHeader.toString());
         }
       }
     }
